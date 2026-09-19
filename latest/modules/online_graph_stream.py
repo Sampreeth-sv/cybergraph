@@ -181,7 +181,10 @@ class OnlineGraphStream:
         hx_scaled = torch.tensor(self.host_scaler.transform(hx_numpy), dtype=torch.float32)
         sx_scaled = torch.tensor(self.service_scaler.transform(sx_numpy), dtype=torch.float32)
         eidx = torch.tensor(eidx_numpy, dtype=torch.long)
-        eattr_scaled = torch.tensor(eattr_numpy, dtype=torch.float32)
+        eattr_scaled = torch.tensor(
+    self.edge_scaler.transform(eattr_numpy),
+    dtype=torch.float32
+)
 
         hidden_dim = hx_scaled.shape[1]
 
