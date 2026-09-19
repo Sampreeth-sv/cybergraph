@@ -106,6 +106,36 @@ SOC-analyst dashboards, distinct from the ML fusion score), `BehaviorAnalyzer`
 `AdaptiveThresholdManager` (recalibrates the AE threshold against a rolling window
 of traffic the other detectors didn't flag).
 
+### 3.5 MITRE ATT&CK Contextualization (Phase 2)
+
+The MITRE ATT&CK mapper (`modules/mitre_attack_mapper.py`) provides
+**defensible, evidence-based technique mapping** — not ML guessing. It
+determines whether observed network behaviors match known ATT&CK techniques
+based on:
+- Behavioral evidence from flow telemetry
+- BARI route analysis
+- Correlation engine findings
+- Attack journey progression
+
+**Supported techniques:** T1046 (Network Service Discovery), T1110 (Brute Force),
+T1498 (Network Denial of Service).
+
+**Design decisions:**
+- **T1059 (Command and Scripting Interpreter) is disabled** because network flow
+  telemetry does not directly observe command or script execution.
+- **T1110 requires actual authentication-attempt evidence** — Reconnaissance alone
+  is insufficient to map to Brute Force.
+- **T1046 requires actual multi-port diversity** from the correlation timeline,
+  not a single-port proxy.
+
+**Single source of truth:** All technique definitions live in
+`datasets/mitre_attack_mapping.json` (version 1.1). The mapper loads from this
+JSON at runtime — there is no duplicate configuration elsewhere.
+
+**Confidence formula:** `confidence = weighted evidence match × model confidence
+damping` (rule-based, not calibrated probability). See `/api/mitre_mappings` for
+the full metadata and evidence weights.
+
 ### 3.1 Why a graph model at all
 
 A single compromised or coordinated attacker rarely looks alarming in isolation —

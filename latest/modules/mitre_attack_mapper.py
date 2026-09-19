@@ -15,9 +15,10 @@ Provides defensible, explainable mappings with confidence scores rather than gue
 """
 
 import time
-from typing import Dict, List, Optional, Tuple
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-
 
 @dataclass
 class MITRETechnique:
@@ -29,6 +30,120 @@ class MITRETechnique:
     behavioral_indicators: Dict[str, float]
     required_confidence_threshold: float
     evidence_weights: Dict[str, float]
+    live_enabled: bool = True
+
+
+# Load technique definitions from JSON file (single source of truth)
+def _load_technique_definitions():
+    """Load MITRE technique definitions from JSON file."""
+    # Load from datasets/mitre_attack_mapping.json (project root relative)
+    json_path = Path(__file__).parent.parent / "datasets" / "mitre_attack_mapping.json"
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+
+        techniques = {}
+        for tech_id, tech_data in data.get("supported_techniques", {}).items():
+            techniques[tech_id] = MITRETechnique(
+                technique_id=tech_data["technique_id"],
+                technique_name=tech_data["technique_name"],
+                tactic=tech_data["tactic"],
+                description=tech_data["description"],
+                behavioral_indicators=tech_data["behavioral_indicators"],
+                required_confidence_threshold=tech_data["required_confidence_threshold"],
+                evidence_weights=tech_data["evidence_weights"],
+                live_enabled=True,
+            )
+
+        # Keep unsupported techniques as definitions for documentation/future use,
+        # but mark them as not live-enabled so the mapper never fabricates evidence.
+        for tech_id, tech_data in data.get("unsupported_techniques", {}).items():
+            techniques[tech_id] = MITRETechnique(
+                technique_id=tech_data.get("technique_id", tech_id),
+                technique_name=tech_data["technique_name"],
+                tactic=tech_data.get("tactic", "Unknown"),
+                description=tech_data.get("description", "No live evidence available in network flow telemetry"),
+                behavioral_indicators={},
+                required_confidence_threshold=1.0,
+                evidence_weights={},
+                live_enabled=False,
+            )
+
+        return techniques
+    except Exception:
+        # Fallback to default techniques if JSON loading fails
+        return {
+            "T1046": MITRETechnique(
+                technique_id="T1046",
+                technique_name="Network Service Discovery",
+                tactic="Discovery",
+                description="Adversaries scan for service configurations to identify exposed services and potential attack vectors",
+                behavioral_indicators={
+                    "port_diversity": 0.3,
+                    "connection_count": 0.25,
+                    "short_durations": 0.2,
+                    "service_probing": 0.25,
+                },
+                required_confidence_threshold=0.7,
+                evidence_weights={
+                    "port_diversity": 0.3,
+                    "connection_count": 0.3,
+                    "short_durations": 0.2,
+                    "service_probing": 0.2,
+                }
+            ),
+            "T1110": MITRETechnique(
+                technique_id="T1110",
+                technique_name="Brute Force",
+                tactic="Credential Access",
+                description="Adversaries attempt multiple login combinations to guess passwords",
+                behavioral_indicators={
+                    "repeated_connections": 0.4,
+                    "auth_patterns": 0.3,
+                    "rate_intensity": 0.3,
+                },
+                required_confidence_threshold=0.65,
+                evidence_weights={
+                    "repeated_connections": 0.4,
+                    "auth_patterns": 0.3,
+                    "rate_intensity": 0.3,
+                }
+            ),
+            "T1498": MITRETechnique(
+                technique_id="T1498",
+                technique_name="Network Denial of Service",
+                tactic="Impact",
+                description="Adversaries disrupt network services by overwhelming targets with traffic",
+                behavioral_indicators={
+                    "volume_burst": 0.4,
+                    "connection_rate": 0.35,
+                    "duration_intensity": 0.25,
+                },
+                required_confidence_threshold=0.75,
+                evidence_weights={
+                    "volume_burst": 0.4,
+                    "connection_rate": 0.35,
+                    "duration_intensity": 0.25,
+                }
+            ),
+            "T1059": MITRETechnique(
+                technique_id="T1059",
+                technique_name="Command and Scripting Interpreter",
+                tactic="Execution",
+                description="Adversaries execute commands or scripts to accomplish objectives",
+                behavioral_indicators={
+                    "command_patterns": 0.4,
+                    "script_execution": 0.35,
+                    "protocol_anomalies": 0.25,
+                },
+                required_confidence_threshold=0.8,
+                evidence_weights={
+                    "command_patterns": 0.4,
+                    "script_execution": 0.35,
+                    "protocol_anomalies": 0.25,
+                }
+            )
+        }
 
 
 class MITREAttackMapper:
@@ -40,82 +155,8 @@ class MITREAttackMapper:
     """
 
     def __init__(self):
-        # Current evidence-based technique mappings
-        self.techniques = {
-            "T1046": MITRETechnique(
-                technique_id="T1046",
-                technique_name="Network Service Discovery",
-                tactic="Discovery",
-                description="Adversaries scan for service configurations to identify exposed services and potential attack vectors",
-                behavioral_indicators={
-                    "port_diversity": 0.3,  # Multiple destination ports
-                    "connection_count": 0.25,  # Many connections to different services
-                    "short_durations": 0.2,  # Quick connection attempts
-                    "service_probing": 0.25,  # Multiple service types
-                },
-                required_confidence_threshold=0.7,
-                evidence_weights={
-                    "port_diversity": 0.3,
-                    "connection_count": 0.3,
-                    "short_durations": 0.2,
-                    "service_probing": 0.2,
-                }
-            ),
-
-            "T1110": MITRETechnique(
-                technique_id="T1110",
-                technique_name="Brute Force",
-                tactic="Credential Access",
-                description="Adversaries attempt multiple login combinations to guess passwords",
-                behavioral_indicators={
-                    "repeated_connections": 0.4,  # Many connections from same source
-                    "auth_patterns": 0.3,  # Authentication service attempts
-                    "rate_intensity": 0.3,  # High connection rates
-                },
-                required_confidence_threshold=0.65,
-                evidence_weights={
-                    "repeated_connections": 0.4,
-                    "auth_patterns": 0.3,
-                    "rate_intensity": 0.3,
-                }
-            ),
-
-            "T1498": MITRETechnique(
-                technique_id="T1498",
-                technique_name="Network Denial of Service",
-                tactic="Impact",
-                description="Adversaries disrupt network services by overwhelming targets with traffic",
-                behavioral_indicators={
-                    "volume_burst": 0.4,  # Sudden traffic volume increase
-                    "connection_rate": 0.35,  # High connection rates
-                    "duration_intensity": 0.25,  # Sustained high traffic
-                },
-                required_confidence_threshold=0.75,
-                evidence_weights={
-                    "volume_burst": 0.4,
-                    "connection_rate": 0.35,
-                    "duration_intensity": 0.25,
-                }
-            ),
-
-            "T1059": MITRETechnique(
-                technique_id="T1059",
-                technique_name="Command and Scripting Interpreter",
-                tactic="Execution",
-                description="Adversaries execute commands or scripts to accomplish objectives",
-                behavioral_indicators={
-                    "command_patterns": 0.4,  # Known command signatures
-                    "script_execution": 0.35,  # Scripting protocol usage
-                    "protocol_anomalies": 0.25,  # Unusual protocol usage
-                },
-                required_confidence_threshold=0.8,
-                evidence_weights={
-                    "command_patterns": 0.4,
-                    "script_execution": 0.35,
-                    "protocol_anomalies": 0.25,
-                }
-            )
-        }
+        # Load technique definitions from JSON file (single source of truth)
+        self.techniques = _load_technique_definitions()
 
     def map_flow_to_techniques(self, flow_record: Dict, bari_result: Dict,
                              correlation_result: Dict, attack_journey: Dict) -> List[Dict]:
@@ -132,6 +173,10 @@ class MITREAttackMapper:
 
         # Check each technique against the evidence
         for tech_id, technique in self.techniques.items():
+            # Skip unsupported techniques (T1059, etc.) — do not fabricate evidence
+            if not technique.live_enabled:
+                continue
+
             confidence = self._calculate_confidence(technique, evidence)
 
             if confidence >= technique.required_confidence_threshold:
@@ -156,13 +201,12 @@ class MITREAttackMapper:
         evidence = {}
 
         # Basic flow characteristics
-        dst_port = flow_record.get("dst_port", 0)
         byte_count = flow_record.get("byte_count", 0)
         pkt_count = flow_record.get("pkt_count", 0)
         duration = flow_record.get("duration", 0)
 
-        # Port diversity (from correlation context)
-        evidence["port_diversity"] = self._calculate_port_diversity(flow_record, correlation_result)
+        # Port diversity from actual correlation timeline (same source IP)
+        evidence["port_diversity"] = self._calculate_port_diversity(correlation_result)
 
         # Connection intensity metrics with duration floor to prevent extreme values
         duration_floor = max(duration, 1.0)  # Prevent division by very small durations
@@ -171,11 +215,8 @@ class MITREAttackMapper:
         evidence["connection_rate"] = pkt_count / duration_floor
         evidence["short_durations"] = 1.0 if duration < 1.0 else 0.0
 
-        # Well-known benign service ports that shouldn't trigger probing evidence
-        benign_service_ports = {53, 67, 68, 123, 161, 162, 500, 4500, 5353}  # DNS, DHCP, NTP, SNMP, etc.
-
-        # Service probing (multiple ports in short time) - exclude benign services
-        evidence["service_probing"] = 1.0 if (dst_port > 0 and dst_port not in benign_service_ports) else 0.0
+        # Service probing: use actual port diversity from correlation timeline
+        evidence["service_probing"] = evidence["port_diversity"]
 
         # BARI-related evidence
         if bari_result:
@@ -194,42 +235,45 @@ class MITREAttackMapper:
         evidence["xgb_prob"] = flow_record.get("xgb_prob", 0.0)
         evidence["ae_score"] = flow_record.get("ae_score", 0.0)
 
-        # Attack type evidence (from correlation)
-        attack_type = correlation_result.get("attack_type", "Normal") if correlation_result else "Normal"
-        evidence["auth_patterns"] = 1.0 if attack_type in ["Exploits", "Reconnaissance"] else 0.0
-        evidence["protocol_anomalies"] = 1.0 if attack_type == "Fuzzer" else 0.0
-
-        # T1059-specific evidence: detect protocol anomalies from suspicious port+protocol combos
-        # C2 ports commonly use UDP (non-standard for those services)
-        c2_udp_ports = {4444, 4445, 5555, 31337}
-        flow_protocol = flow_record.get("protocol", 6)
-        if dst_port in c2_udp_ports and flow_protocol == 17:
-            evidence["protocol_anomalies"] = max(evidence.get("protocol_anomalies", 0.0), 0.8)
-
-        # Command patterns: detected from C2 port access with non-trivial payload sizes
-        if dst_port in c2_udp_ports and byte_count > 100:
-            evidence["command_patterns"] = 0.8
-        else:
-            evidence["command_patterns"] = 0.0
-
-        # Script execution: detected from scripting-like patterns (high pkt rate on unusual ports)
-        if dst_port in (8080, 8443) and pkt_count > 10:
-            evidence["script_execution"] = 0.6
-        elif dst_port in c2_udp_ports:
-            evidence["script_execution"] = 0.5
-        else:
-            evidence["script_execution"] = 0.0
+        # T1110 requires actual authentication-attempt evidence. Reconnaissance alone
+        # is NOT evidence of brute force, so we do not derive auth_patterns from it.
+        evidence["auth_patterns"] = 0.0
+        evidence["protocol_anomalies"] = 0.0
 
         return evidence
 
-    def _calculate_port_diversity(self, flow_record: Dict, correlation_result: Dict) -> float:
-        """Estimate port diversity from correlation timeline if available."""
-        # Simplified: if correlation exists and shows multiple ports, diversity is high
-        if correlation_result:
-            # This would need correlation timeline data for accurate calculation
-            # For now, use destination port as proxy
-            dst_port = flow_record.get("dst_port", 0)
-            return min(1.0, dst_port / 100.0)  # Normalize to 0-1
+    def _calculate_port_diversity(self, correlation_result: Dict) -> float:
+        """Calculate port diversity from actual correlation timeline for same source IP."""
+        if not correlation_result:
+            return 0.0
+
+        timeline = correlation_result.get("timeline", [])
+        if not timeline:
+            return 0.0
+
+        # Collect distinct destination ports from timeline events
+        ports = set()
+        for event in timeline:
+            if isinstance(event, dict) and isinstance(event.get("dst_port"), (int, float)):
+                ports.add(int(event["dst_port"]))
+
+        # Filter out invalid ports
+        valid_ports = {p for p in ports if p > 0}
+        if len(valid_ports) <= 1:
+            return 0.0  # No multi-port diversity
+
+        # Require a minimum number of total events to validate the diversity
+        event_count = len(timeline)
+        if event_count < 2:
+            return 0.0
+
+        # Normalize: more distinct ports and more events = higher diversity
+        # 3+ distinct ports is strong evidence; 2 distinct ports with many events is moderate
+        distinct_count = len(valid_ports)
+        if distinct_count >= 3:
+            return min(1.0, 0.6 + 0.1 * min(event_count, 20) / 20.0)
+        elif distinct_count == 2:
+            return min(1.0, 0.3 + 0.1 * min(event_count, 20) / 20.0)
         return 0.0
 
     def _calculate_confidence(self, technique: MITRETechnique, evidence: Dict[str, float]) -> float:
@@ -325,12 +369,19 @@ class MITREAttackMapper:
         return evidence_points[:5]  # Limit to top 5 evidence points
 
     def get_supported_techniques(self) -> List[str]:
-        """Return list of supported technique IDs."""
-        return list(self.techniques.keys())
+        """Return list of live-enabled technique IDs."""
+        return [
+            tech_id
+            for tech_id, technique in self.techniques.items()
+            if technique.live_enabled
+        ]
 
     def get_technique_info(self, technique_id: str) -> Optional[MITRETechnique]:
-        """Get detailed information about a specific technique."""
-        return self.techniques.get(technique_id)
+        """Get detailed information about a specific live-enabled technique."""
+        technique = self.techniques.get(technique_id)
+        if technique is None or not technique.live_enabled:
+            return None
+        return technique
 
     def explain_mapping(self, mapping: Dict) -> str:
         """Provide human-readable explanation of a technique mapping."""

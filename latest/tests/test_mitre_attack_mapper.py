@@ -75,6 +75,11 @@ def sample_correlation_result():
         "escalation_detected": True,
         "src_ip": "192.168.1.100",
         "event_count": 8,
+        "timeline": [
+            {"timestamp": "12:00:01", "src_ip": "192.168.1.100", "dst_ip": "10.40.182.10", "dst_port": 443, "protocol": 6, "attack_type": "Reconnaissance", "gnn_risk": 0.4, "xgb_prob": 0.3, "ae_score": 0.01, "fusion_score": 0.35, "risk_level": "Low"},
+            {"timestamp": "12:00:02", "src_ip": "192.168.1.100", "dst_ip": "10.40.182.20", "dst_port": 22, "protocol": 6, "attack_type": "Reconnaissance", "gnn_risk": 0.4, "xgb_prob": 0.3, "ae_score": 0.01, "fusion_score": 0.35, "risk_level": "Low"},
+            {"timestamp": "12:00:03", "src_ip": "192.168.1.100", "dst_ip": "10.40.182.30", "dst_port": 80, "protocol": 6, "attack_type": "Reconnaissance", "gnn_risk": 0.4, "xgb_prob": 0.3, "ae_score": 0.01, "fusion_score": 0.35, "risk_level": "Low"},
+        ]
     }
 
 
@@ -97,28 +102,28 @@ def sample_attack_journey():
 # ── Test Cases (10 tests) ─────────────────────────────────────────────────
 
 class TestSupportedTechniques:
-    """Requirement 2.1: All 4 supported techniques are detectable."""
+    """Requirement 2.1: Supported techniques are detectable with valid evidence."""
 
     def test_t1046_network_service_discovery_detected(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
-        """T1046 (Network Service Discovery) should be detected for port-probing patterns."""
+        """T1046 (Network Service Discovery) should be detected for multi-port scanning."""
         flow = dict(sample_flow_record)
         flow["dst_port"] = 443  # HTTPS probing context
         mappings = mapper.map_flow_to_techniques(
             flow, sample_bari_result, sample_correlation_result, sample_attack_journey
         )
         tech_ids = [m["technique_id"] for m in mappings]
-        assert "T1046" in tech_ids, f"T1046 should be detected. Got: {tech_ids}"
+        assert "T1046" in tech_ids, f"T1046 should be detected for multi-port scanning. Got: {tech_ids}"
 
-    def test_t1110_brute_force_detected(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
-        """T1110 (Brute Force) should be detected for repeated connection patterns."""
+    def test_t1110_no_mapping_from_reconnaissance(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
+        """T1110 should NOT be detected from Reconnaissance alone (no auth evidence)."""
         flow = dict(sample_flow_record)
-        flow["dst_port"] = 22  # SSH brute force context
-        flow["pkt_count"] = 500.0  # High packet rate suggests brute force
+        flow["dst_port"] = 22
+        flow["pkt_count"] = 500.0  # High packet rate
         mappings = mapper.map_flow_to_techniques(
             flow, sample_bari_result, sample_correlation_result, sample_attack_journey
         )
         tech_ids = [m["technique_id"] for m in mappings]
-        assert "T1110" in tech_ids, f"T1110 should be detected. Got: {tech_ids}"
+        assert "T1110" not in tech_ids, f"T1110 should NOT map from Reconnaissance alone. Got: {tech_ids}"
 
     def test_t1498_dos_detected(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
         """T1498 (Network Denial of Service) should be detected for high-volume traffic."""
@@ -133,8 +138,8 @@ class TestSupportedTechniques:
         tech_ids = [m["technique_id"] for m in mappings]
         assert "T1498" in tech_ids, f"T1498 should be detected. Got: {tech_ids}"
 
-    def test_t1059_command_scripting_detected(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
-        """T1059 (Command and Scripting Interpreter) should be detected for protocol anomalies."""
+    def test_t1059_disabled_no_mapping(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
+        """T1059 is currently unsupported — network flow alone should NOT map to T1059."""
         flow = dict(sample_flow_record)
         flow["dst_port"] = 4444  # Backdoor/C2 port
         flow["protocol"] = 17  # UDP anomaly
@@ -142,7 +147,7 @@ class TestSupportedTechniques:
             flow, sample_bari_result, sample_correlation_result, sample_attack_journey
         )
         tech_ids = [m["technique_id"] for m in mappings]
-        assert "T1059" in tech_ids, f"T1059 should be detected. Got: {tech_ids}"
+        assert "T1059" not in tech_ids, f"T1059 should be disabled (no command/script evidence). Got: {tech_ids}"
 
 
 class TestConfidenceAndEvidence:
@@ -219,16 +224,16 @@ class TestAPIs:
     """Requirement 2.4: Public API methods work correctly."""
 
     def test_get_supported_techniques(self, mapper):
-        """get_supported_techniques returns exactly the 4 supported IDs."""
+        """get_supported_techniques returns exactly the 3 supported IDs (T1059 disabled)."""
         supported = mapper.get_supported_techniques()
-        assert set(supported) == {"T1046", "T1110", "T1498", "T1059"}, (
-            f"Expected 4 supported techniques, got: {supported}"
+        assert set(supported) == {"T1046", "T1110", "T1498"}, (
+            f"Expected 3 supported techniques, got: {supported}"
         )
-        assert len(supported) == 4
+        assert len(supported) == 3
 
     def test_get_technique_info(self, mapper):
-        """get_technique_info returns MITRETechnique dataclass for supported techniques."""
-        for tech_id in ["T1046", "T1110", "T1498", "T1059"]:
+        """get_technique_info returns MITRETechnique dataclass for live-enabled techniques."""
+        for tech_id in ["T1046", "T1110", "T1498"]:
             info = mapper.get_technique_info(tech_id)
             assert info is not None, f"{tech_id} should have info"
             assert isinstance(info, MITRETechnique)
@@ -238,9 +243,15 @@ class TestAPIs:
             assert info.required_confidence_threshold > 0
 
     def test_get_technique_info_none(self, mapper):
-        """get_technique_info returns None for unsupported techniques."""
-        info = mapper.get_technique_info("T1078")  # Valid Accounts - unsupported
-        assert info is None
+        """get_technique_info returns None for unsupported/disabled techniques."""
+        for tech_id in ["T1078", "T1059"]:
+            info = mapper.get_technique_info(tech_id)
+            assert info is None, f"{tech_id} should return None (unsupported/disabled)"
+
+    def test_get_technique_info_disabled_t1059(self, mapper):
+        """T1059 is documented but disabled - get_technique_info should return None."""
+        info = mapper.get_technique_info("T1059")
+        assert info is None, "T1059 should be disabled and return None"
 
     def test_explain_mapping(self, mapper, sample_flow_record, sample_bari_result, sample_correlation_result, sample_attack_journey):
         """explain_mapping returns a human-readable string."""
