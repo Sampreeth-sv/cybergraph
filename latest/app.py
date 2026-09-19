@@ -856,7 +856,7 @@ def _classify_attack_type(flow_rec):
     byte_count = flow_rec.get("byte_count", 0)
     duration = flow_rec.get("duration", 1.0)
 
-    if xgb_prob >= 0.75 or ae_score >= 0.5:
+    if xgb_prob >= XGB_PROB_HIGH or ae_score >= AE_SCORE_HIGH:
         return "Exploits"
     elif pkt_count / max(duration, 0.001) > 500:
         return "DoS"
@@ -935,9 +935,15 @@ def stream_step():
         pyg_data = None
         if gnn_stream is not None:
             gnn_stream.ingest_flow(flow_rec)
-            probs, pyg_data, h_map, s_map, gnn_latency_ms = gnn_stream.evaluate_realtime_gnn_risk()
+            probs, pyg_data, h_map, s_map, edge_prob_map = gnn_stream.evaluate_realtime_gnn_risk()
             if len(probs) > 0:
-                gnn_edge_risk = float(probs[-1])
+                # Use deterministic edge key mapping instead of probs[-1]
+                # (NetworkX edge order is not guaranteed to match current flow)
+                edge_key = (
+                    f"HOST:{flow_rec['src_ip']}",
+                    f"SERVICE:{flow_rec['dst_port']}/{flow_rec['protocol']}"
+                )
+                gnn_edge_risk = edge_prob_map.get(edge_key, 0.0)
 
         combined_risk = max(base_fusion, gnn_edge_risk)
 
@@ -976,7 +982,7 @@ def stream_step():
             xgb_prob=float(flow_rec["xgb_prob"]),
             ae_score=float(flow_rec["ae_score"]),
             fusion_score=float(flow_rec["fusion_score"]),
-            risk_level="L3" if combined_risk >= 0.75 else ("L2" if combined_risk >= 0.35 else "L1"),
+            risk_level="L3" if combined_risk >= RISK_L2_MAX else ("L2" if combined_risk >= RISK_L1_MAX else "L1"),
             geo=_lookup_geo(flow_rec["src_ip"]),
             capture_ms=last_lat["capture"],
             feature_prep_ms=last_lat["feature_prep"],
@@ -992,14 +998,13 @@ def stream_step():
 
         # --- MITRE ATT&CK Mapping ---
         attack_journey_payload = eval_res.get("attack_journey", {})
+        # Pass the actual correlation report (not a synthetic dict) so the MITRE
+        # mapper can derive evidence from the real per-source timeline.
+        correlation_report = correlation_engine._build_report(flow_rec["src_ip"])
         mitre_mappings = mitre_mapper.map_flow_to_techniques(
             flow_record=flow_rec,
             bari_result=_bari,
-            correlation_result={
-                "attack_type": attack_type,
-                "correlation_score": 0.5,
-                "kill_chain_stage": "RECONNAISSANCE",
-            },
+            correlation_result=correlation_report,
             attack_journey=attack_journey_payload,
         )
         eval_res["mitre_mappings"] = mitre_mappings
@@ -1185,11 +1190,25 @@ def threat_priorities():
     # Also add MITRE enrichment
     for p in priorities:
         src_ip = p["source_ip"]
-        # Check if MITRE mappings exist for this IP
-        p["mitre_techniques"] = []
+        # Get actual MITRE mappings for this source IP
+        correlation_report = correlation_engine._build_report(src_ip)
+        mitre_mappings = mitre_mapper.map_flow_to_techniques(
+            flow_record={"src_ip": src_ip},  # Minimal flow record for context
+            bari_result={},  # Empty BARI result
+            correlation_result=correlation_report,
+            attack_journey={"journey_path": [], "attack_objective": {}}  # Minimal attack journey
+        )
+        p["mitre_techniques"] = [
+            {
+                "technique_id": m["technique_id"],
+                "technique_name": m["technique_name"],
+                "confidence": m["confidence"]
+            }
+            for m in mitre_mappings
+        ]
     return jsonify({
         "priorities": priorities,
-        "mitre_supported": ["T1046", "T1110", "T1498", "T1059"],
+        "mitre_supported": ["T1046", "T1110", "T1498"],  # T1059 is disabled
         "total_active_threats": len(priorities),
     })
 
@@ -1228,7 +1247,7 @@ def mitre_mappings():
         "supported_techniques": supported,
         "unsupported_count": 17,
         "mapping_method": "evidence-based deterministic rules",
-        "confidence_formula": "confidence = evidence_strength × behavioral_match × temporal_consistency",
+        "confidence_formula": "confidence = weighted evidence match × model confidence damping (rule-based, not calibrated probability)",
         "separation_of_concerns": "MITRE provides ATT&CK contextualization; XGBoost/AE/GNN/BARI detect and score behavior",
     })
 
@@ -1268,7 +1287,7 @@ def export_report():
             <h3>MITRE ATT&CK Integration (Phase 2)</h3>
             <p><strong>Mapping Method:</strong> Evidence-based deterministic rules (no ML guessing)</p>
             <p><strong>Supported Techniques:</strong> T1046, T1110, T1498, T1059</p>
-            <p><strong>Confidence Formula:</strong> confidence = evidence_strength × behavioral_match × temporal_consistency</p>
+            <p><strong>Confidence Formula:</strong> confidence = weighted evidence match × model confidence damping (rule-based, not calibrated probability)</p>
             <p><strong>Separation of Concerns:</strong> MITRE contextualizes; XGBoost/AE/GNN/BARI detect and score</p>
             <div class="mitre-section">
                 <h3>Supported ATT&CK Techniques</h3>

@@ -20,6 +20,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
+from config.risk_thresholds import RISK_L1_MAX, RISK_L2_MAX
 from train_xgboost_ae import FEATURE_COLS
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -96,9 +97,9 @@ class FeatureSchemaValidator:
         duration = float(live_flow_dict.get("FLOW_DURATION_MILLISECONDS", 1.0))
 
         level = "Level 1 — Normal"
-        if model_risk >= 0.80:
+        if model_risk >= RISK_L2_MAX:
             level = "Level 3 — High Risk"
-        elif model_risk >= 0.50:
+        elif model_risk >= RISK_L1_MAX:
             level = "Level 2 — Suspicious"
 
         return {

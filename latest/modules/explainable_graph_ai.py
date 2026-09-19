@@ -14,7 +14,7 @@ Generates model-driven, human-interpretable explanations using:
 import math
 import numpy as np
 from modules.explainability import ExplainabilityEngine
-
+from config.risk_thresholds import XGB_PROB_HIGH, AE_SCORE_HIGH
 
 class ExplainableGraphAI:
     """Model-Driven Explainable Graph AI (XAI) Engine with SHAP Integration."""
@@ -69,9 +69,9 @@ class ExplainableGraphAI:
 
         # Generate "Why This Attack?" Human-Readable Bullet Reasons with SHAP callouts
         why_reasons = []
-        if xgb_prob >= 0.70:
+        if xgb_prob >= XGB_PROB_HIGH:
             why_reasons.append("✓ High XGBoost Malicious Pattern Match (SHAP Confirmed)")
-        if ae_score >= 0.005:
+        if ae_score >= AE_SCORE_HIGH:
             why_reasons.append("✓ High Autoencoder Reconstruction Anomaly")
         if byte_cnt > 500:
             why_reasons.append("✓ Abnormal Traffic Volume Burstiness")

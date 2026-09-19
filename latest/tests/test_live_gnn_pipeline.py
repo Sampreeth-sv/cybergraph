@@ -139,9 +139,17 @@ def test_end_to_end_live_pipeline():
     stream.ingest_flow(flow_rec)
 
     # Steps 3 & 4: Dynamic Temporal GNN inference & edge risk prediction
-    probs, pyg_data, h_map, s_map = stream.evaluate_realtime_gnn_risk()
+    probs, pyg_data, h_map, s_map, edge_prob_map = stream.evaluate_realtime_gnn_risk()
     assert len(probs) > 0, "GNN must produce at least 1 edge probability"
-    gnn_pred = float(probs[-1])
+
+    # Use edge probability map (deterministic, not probs[-1])
+    sample_edge_key = ("HOST:192.168.1.105", "SERVICE:80/6")
+    if sample_edge_key in edge_prob_map:
+        gnn_pred = edge_prob_map[sample_edge_key]
+    else:
+        # Fallback: use first edge probability if exact key not present
+        gnn_pred = float(probs[0])
+
     assert 0.0 <= gnn_pred <= 1.0, f"GNN edge probability out of range: {gnn_pred}"
 
     # Step 5: Fusion / risk engine evaluation

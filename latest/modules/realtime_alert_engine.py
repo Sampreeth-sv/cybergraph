@@ -1,16 +1,20 @@
 """
 modules/realtime_alert_engine.py
 ================================
-PHASE 7: Tiered Real-Time Security Response & Alerting Engine with SHAP Integration
-
-Evaluates incoming flows in real time under 3 Tiered Security Response Levels:
-  Level 1 — Normal     (Risk < 0.35)           : Allow flow & maintain routine monitoring.
-  Level 2 — Suspicious (0.35 <= Risk < 0.75)   : SOC Alert + SHAP TreeExplainer XAI.
-  Level 3 — High Risk  (Risk >= 0.75)          : Critical Alert + Bipartite Attack Path + Recommended / Active Firewall Response.
+PHASE 3: Tiered Real-Time Security Response & Alerting Engine with SHAP Integration
 """
 
 import time
-import json
+import logging
+
+from config.risk_thresholds import (
+    RISK_L1_MAX,
+    RISK_L2_MAX,
+    BARI_L1_MAX,
+    BARI_L2_MAX,
+    XGB_PROB_LOW,
+)
+
 from modules.attack_path_predictor import AttackPathPredictor
 from modules.explainable_graph_ai import ExplainableGraphAI
 from modules.firewall_response_executor import FirewallResponseExecutor
@@ -18,21 +22,65 @@ from modules.attack_journey_engine import AttackJourneyEngine
 from train_xgboost_ae import FEATURE_COLS
 
 
+logger = logging.getLogger(__name__)
+
+
 class RealtimeAlertEngine:
-    """Tiered Real-Time Security Response & Alerting Engine with SHAP & Attack Journey Intelligence."""
+    """Tiered real-time security response and alerting engine."""
 
     def __init__(self, enable_real_blocking=False, bari_engine=None):
         self.enable_real_blocking = enable_real_blocking
         self.predictor = AttackPathPredictor(risk_threshold=0.50)
         self.xai = ExplainableGraphAI()
-        self.fw_executor = FirewallResponseExecutor(enable_real_blocking=enable_real_blocking)
+        self.fw_executor = FirewallResponseExecutor(
+            enable_real_blocking=enable_real_blocking
+        )
         self.journey_engine = AttackJourneyEngine()
         self.bari_engine = bari_engine
 
+    def _safe_xai_explain(
+        self,
+        edge_attr,
+        risk_score,
+        source_host,
+        target_service,
+        raw_feat_1d,
+        xgb_model,
+        feature_cols,
+    ):
+        """Run XAI without allowing XAI failure to stop alert processing."""
+        try:
+            return self.xai.explain_flow_edge(
+                edge_attr=edge_attr,
+                risk_score=risk_score,
+                source_host=source_host,
+                target_service=target_service,
+                raw_feat_1d=raw_feat_1d,
+                xgb_model=xgb_model,
+                feature_cols=feature_cols,
+            )
+        except Exception as exc:
+            logger.exception("XAI explanation failed; continuing alert pipeline: %s", exc)
+            return {
+                "status": "XAI_UNAVAILABLE",
+                "message": "XAI explanation unavailable; alert processing continued.",
+                "error": str(exc),
+            }
 
-    def process_flow_eval(self, flow_rec, risk_score, snapshot=None, host_states=None, prev_host_states=None, xgb_model=None, bari_res=None):
-        """Processes a flow evaluation and returns a 3-level security response object with BARI Route Intelligence & SHAP attributions."""
+    def process_flow_eval(
+        self,
+        flow_rec,
+        risk_score,
+        snapshot=None,
+        host_states=None,
+        prev_host_states=None,
+        xgb_model=None,
+        bari_res=None,
+    ):
+        """Process a flow and return the corresponding security response."""
+
         risk_score = float(risk_score)
+
         src_ip = flow_rec["src_ip"]
         dst_ip = flow_rec["dst_ip"]
         dst_port = flow_rec["dst_port"]
@@ -45,6 +93,7 @@ class RealtimeAlertEngine:
         bari_score = 0.0
         route_str = ""
         exp_summary = ""
+
         if isinstance(bari_res, dict):
             bari_score = float(bari_res.get("bari_score", 0.0))
             route_str = bari_res.get("route_string", "")
@@ -55,10 +104,14 @@ class RealtimeAlertEngine:
         host_id = f"HOST:{src_ip}"
         service_id = f"SERVICE:{dst_port}/{proto}"
 
-        # Determine level string first to update journey engine
-        if risk_score < 0.35 and bari_score < 0.35 and ae_score < 0.005 and xgb_prob < 0.30:
+        if (
+            risk_score < RISK_L1_MAX
+            and bari_score < BARI_L1_MAX
+            and ae_score < 0.005
+            and xgb_prob < XGB_PROB_LOW
+        ):
             level_name = "Level 1 — Normal"
-        elif risk_score < 0.75 and bari_score < 0.65:
+        elif risk_score < RISK_L2_MAX and bari_score < BARI_L2_MAX:
             level_name = "Level 2 — Suspicious / Emerging"
         else:
             level_name = "Level 3 — High Risk"
@@ -74,9 +127,6 @@ class RealtimeAlertEngine:
             bari_engine=self.bari_engine,
         )
 
-        # ------------------------------------------------------------
-        # LEVEL 1 — NORMAL: No meaningful attack evidence (Risk < 0.35 and BARI < 0.35)
-        # ------------------------------------------------------------
         if level_name == "Level 1 — Normal":
             return {
                 "level": "Level 1 — Normal",
@@ -87,13 +137,15 @@ class RealtimeAlertEngine:
                 "source_host": host_id,
                 "target_service": service_id,
                 "timestamp": flow_rec["timestamp"],
-                "badge_color": "#10b981",  # Emerald Green
-                "summary": f"Flow [{host_id} -> {service_id}] benign (Risk: {risk_score:.4f}, BARI: {bari_score:.4f}). Allowed.",
+                "badge_color": "#10b981",
+                "summary": (
+                    f"Flow [{host_id} -> {service_id}] benign "
+                    f"(Risk: {risk_score:.4f}, BARI: {bari_score:.4f}). Allowed."
+                ),
                 "attack_journey": journey_payload,
             }
 
-        # Calculate SHAP TreeExplainer & Standardized Feature Saliency XAI for Level 2 & Level 3
-        edge_attr_dummy = [
+        edge_attr = [
             flow_rec["timestamp"],
             flow_rec["dst_port"],
             flow_rec["protocol"],
@@ -105,8 +157,8 @@ class RealtimeAlertEngine:
             flow_rec["fusion_score"],
         ]
 
-        xai_report = self.xai.explain_flow_edge(
-            edge_attr=edge_attr_dummy,
+        xai_report = self._safe_xai_explain(
+            edge_attr=edge_attr,
             risk_score=risk_score,
             source_host=host_id,
             target_service=service_id,
@@ -115,9 +167,6 @@ class RealtimeAlertEngine:
             feature_cols=FEATURE_COLS,
         )
 
-        # ------------------------------------------------------------
-        # LEVEL 2 — SUSPICIOUS / EMERGING (EARLY WARNING STAGE)
-        # ------------------------------------------------------------
         if level_name == "Level 2 — Suspicious / Emerging":
             return {
                 "level": "Level 2 — Suspicious / Emerging",
@@ -128,27 +177,43 @@ class RealtimeAlertEngine:
                 "source_host": host_id,
                 "target_service": service_id,
                 "timestamp": flow_rec["timestamp"],
-                "badge_color": "#f59e0b",  # Warning Amber
+                "badge_color": "#f59e0b",
                 "xai_explanation": xai_report,
-                "route_explanation": exp_summary or f"Observed Route: {route_str}",
-                "summary": f"EARLY WARNING: [{host_id} -> {service_id}] Route Anomaly Detected (BARI: {bari_score:.4f}, Risk: {risk_score:.4f}). {exp_summary}",
+                "route_explanation": (
+                    exp_summary or f"Observed Route: {route_str}"
+                ),
+                "summary": (
+                    f"EARLY WARNING: [{host_id} -> {service_id}] "
+                    f"Route Anomaly Detected "
+                    f"(BARI: {bari_score:.4f}, Risk: {risk_score:.4f}). "
+                    f"{exp_summary}"
+                ),
                 "attack_journey": journey_payload,
             }
 
-        # ------------------------------------------------------------
-        # LEVEL 3 — CRITICAL / CONFIRMED
-        # ------------------------------------------------------------
-        fw_res = self.fw_executor.execute_block(src_ip, port=dst_port)
+        fw_res = self.fw_executor.execute_block(
+            src_ip,
+            port=dst_port,
+        )
 
-        # Predict multi-hop attack propagation path if snapshot provided
         attack_paths = []
+
         if snapshot is not None:
-            attack_paths = self.predictor.predict_attack_paths(snapshot, top_k_paths=1)
+            attack_paths = self.predictor.predict_attack_paths(
+                snapshot,
+                top_k_paths=1,
+            )
 
         bipartite_chain = (
             attack_paths[0]["bipartite_attack_chain"]
             if attack_paths
-            else [host_id, service_id, f"HOST:{dst_ip}", "SERVICE:80/6", "HOST:10.40.85.10"]
+            else [
+                host_id,
+                service_id,
+                f"HOST:{dst_ip}",
+                "SERVICE:80/6",
+                "HOST:10.40.85.10",
+            ]
         )
 
         return {
@@ -159,7 +224,7 @@ class RealtimeAlertEngine:
             "source_host": host_id,
             "target_service": service_id,
             "timestamp": flow_rec["timestamp"],
-            "badge_color": "#ef4444",  # Critical Red
+            "badge_color": "#ef4444",
             "xai_explanation": xai_report,
             "bipartite_attack_chain": bipartite_chain,
             "recommended_firewall_action": {
@@ -167,10 +232,16 @@ class RealtimeAlertEngine:
                 "execution_mode": fw_res["execution_mode"],
                 "target_ip": src_ip,
                 "target_port": dst_port,
-                "windows_netsh_rule_preview": fw_res.get("command_preview", fw_res.get("message", "")),
+                "windows_netsh_rule_preview": fw_res.get(
+                    "command_preview",
+                    fw_res.get("message", ""),
+                ),
                 "real_blocking_enabled": self.enable_real_blocking,
             },
-            "summary": f"CRITICAL ATTACK: [{host_id} -> {service_id}] Risk: {risk_score:.4f}. Recommended Action: Block IP {src_ip}.",
+            "summary": (
+                f"CRITICAL ATTACK: [{host_id} -> {service_id}] "
+                f"Risk: {risk_score:.4f}. "
+                f"Recommended Action: Block IP {src_ip}."
+            ),
             "attack_journey": journey_payload,
         }
-
