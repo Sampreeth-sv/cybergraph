@@ -124,5 +124,23 @@ class DynamicBipartiteTemporalGNN(nn.Module):
     def forward(self, host_x, service_x, edge_index, edge_attr, prev_host_h=None, prev_service_h=None):
         h_conv, s_conv = self.conv1(host_x, service_x, edge_index)
         h_state, s_state = self.temporal_update(h_conv, s_conv, prev_host_h, prev_service_h)
+        cat_debug = torch.cat(
+    [
+        h_state[edge_index[0]],
+        s_state[edge_index[1]],
+        edge_attr
+    ],
+    dim=1
+)
+
+        #print(
+    #"[GNN CLASSIFIER INPUT DEBUG]",
+    #"min=", float(cat_debug.min()),
+    #"max=", float(cat_debug.max()),
+    #"mean=", float(cat_debug.mean()),
+    #"std=", float(cat_debug.std()))
+
+       # print( "[GNN STATE DEBUG]","host min/max=", float(h_state.min()), float(h_state.max()), "service min/max=", float(s_state.min()), float(s_state.max()))
+
         logits = self.classifier(h_state, s_state, edge_index, edge_attr)
         return logits, h_state, s_state

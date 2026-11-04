@@ -73,9 +73,9 @@ class RealtimeAlertEngine:
         risk_score,
         snapshot=None,
         host_states=None,
-        prev_host_states=None,
         xgb_model=None,
         bari_res=None,
+        node_type_resolver=None,
     ):
         """Process a flow and return the corresponding security response."""
 
@@ -101,15 +101,18 @@ class RealtimeAlertEngine:
         elif isinstance(bari_res, (float, int)):
             bari_score = float(bari_res)
 
-        host_id = f"HOST:{src_ip}"
+        if node_type_resolver:
+            ntype = node_type_resolver(src_ip)
+            host_id = f"{ntype}:{src_ip}"
+        else:
+            host_id = f"HOST:{src_ip}"
         service_id = f"SERVICE:{dst_port}/{proto}"
 
-        if (
-            risk_score < RISK_L1_MAX
-            and bari_score < BARI_L1_MAX
-            and ae_score < 0.005
-            and xgb_prob < XGB_PROB_LOW
-        ):
+        base_ml_evidence = (
+    xgb_prob >= 0.70
+    or ae_score >= 0.50
+    or risk_score >= RISK_L1_MAX)
+        if not base_ml_evidence:
             level_name = "Level 1 — Normal"
         elif risk_score < RISK_L2_MAX and bari_score < BARI_L2_MAX:
             level_name = "Level 2 — Suspicious / Emerging"
@@ -171,7 +174,7 @@ class RealtimeAlertEngine:
             return {
                 "level": "Level 2 — Suspicious / Emerging",
                 "risk_category": "EARLY_WARNING_THREAT",
-                "risk_score": max(risk_score, 0.4500),
+                "risk_score": risk_score,
                 "bari_score": bari_score,
                 "action": "EARLY_WARNING_SOC_ALERT",
                 "source_host": host_id,
@@ -191,10 +194,41 @@ class RealtimeAlertEngine:
                 "attack_journey": journey_payload,
             }
 
+        if not base_ml_evidence or risk_score < RISK_L2_MAX:
+            logger.warning(
+        "[BLOCK SUPPRESSED] src=%s dst_port=%s "
+        "risk=%.6f bari=%.6f base_ml=%s",
+        src_ip,
+        dst_port,
+        risk_score,
+        bari_score,
+        base_ml_evidence,
+    )
+            return {
+        "level": "Level 2 — Suspicious / Emerging",
+        "risk_category": "EARLY_WARNING_THREAT",
+        "risk_score": risk_score,
+        "bari_score": bari_score,
+        "action": "EARLY_WARNING_SOC_ALERT",
+        "source_host": host_id,
+        "target_service": service_id,
+        "timestamp": flow_rec["timestamp"],
+        "badge_color": "#f59e0b",
+        "xai_explanation": xai_report,
+        "route_explanation": (
+            exp_summary or f"Observed Route: {route_str}"
+        ),
+        "summary": (
+            f"EARLY WARNING: [{host_id} -> {service_id}] "
+            f"Contextual anomaly detected "
+            f"(BARI: {bari_score:.4f}, Risk: {risk_score:.4f})."
+        ),
+        "attack_journey": journey_payload,
+    }
         fw_res = self.fw_executor.execute_block(
-            src_ip,
-            port=dst_port,
-        )
+    src_ip,
+    port=dst_port,
+)
 
         attack_paths = []
 
@@ -204,15 +238,16 @@ class RealtimeAlertEngine:
                 top_k_paths=1,
             )
 
+        dst_node_label = f"{node_type_resolver(dst_ip)}:{dst_ip}" if node_type_resolver else f"EXTERNAL:{dst_ip}"
         bipartite_chain = (
             attack_paths[0]["bipartite_attack_chain"]
             if attack_paths
             else [
                 host_id,
                 service_id,
-                f"HOST:{dst_ip}",
+                dst_node_label,
                 "SERVICE:80/6",
-                "HOST:10.40.85.10",
+                "EXTERNAL:10.40.85.10",
             ]
         )
 

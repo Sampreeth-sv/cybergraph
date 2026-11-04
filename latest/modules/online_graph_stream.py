@@ -34,7 +34,7 @@ class OnlineGraphStream:
         # If a node is not in the dict, its state is initialized to zeros.
         self.host_states: dict = {}        # {host_node_id: torch_tensor}
         self.service_states: dict = {}     # {service_node_id: torch_tensor}
-
+        self.edge_observation_counts = {}
     def ingest_flow(self, flow_rec):
         """Ingests a single flow record into the real-time graph stream."""
         self.flow_buffer.append(flow_rec)
@@ -85,7 +85,9 @@ class OnlineGraphStream:
 
             host_node = self.builder.make_host_id(src_ip)
             service_node = self.builder.make_service_id(dst_port, protocol)
+            edge_key = (host_node, service_node)
 
+            self.edge_observation_counts[edge_key] = (self.edge_observation_counts.get(edge_key, 0) + 1)
             active_edges.add((host_node, service_node))
             active_edges.add((service_node, host_node))  # undirected check
             active_hosts.add(host_node)
@@ -183,10 +185,14 @@ class OnlineGraphStream:
         eidx = torch.tensor(eidx_numpy, dtype=torch.long)
         eattr_scaled = torch.tensor(
     self.edge_scaler.transform(eattr_numpy),
-    dtype=torch.float32
-)
+    dtype=torch.float32)
+        #print("[GNN EDGE FEATURE DEBUG]",    "raw min=", float(eattr_numpy.min()),"raw max=", float(eattr_numpy.max()),"scaled min=", float(eattr_scaled.min()),"scaled max=", float(eattr_scaled.max()),)
 
-        hidden_dim = hx_scaled.shape[1]
+        #print("[GNN EDGE FEATURE ROW 0 RAW]",eattr_numpy[0].tolist())
+
+        #print("[GNN EDGE FEATURE ROW 0 SCALED]",eattr_scaled[0].tolist())
+
+        hidden_dim = self.gnn_model.temporal_update.host_gru.hidden_size
 
         # Build prev GRU states from persistence dictionaries
         prev_host_h = self._build_prev_host_h_tensor(h_map, hidden_dim, hx_scaled.device)
@@ -217,7 +223,10 @@ class OnlineGraphStream:
             self.service_states[service_id] = next_h_s[idx].clone()
 
         # ── Build edge key → probability mapping (replaces probs[-1]) ─────
-        # Map each GNN edge to its (host_node_id, service_node_id) key and corresponding prob.
+        # Build O(1) inverted index: tensor_index → node_id
+        inv_h_map = {idx: nid for nid, idx in h_map.items()}
+        inv_s_map = {idx: sid for sid, idx in s_map.items()}
+
         edge_prob_map = {}
         edge_index = eidx  # shape (2, num_edges)
         edge_probs = probs.flatten()  # shape (num_edges,)
@@ -226,21 +235,25 @@ class OnlineGraphStream:
             h_idx = int(edge_index[0, edge_idx])
             s_idx = int(edge_index[1, edge_idx])
 
-            # Reverse-lookup host_node_id from h_map: h_map[host_id] = idx → find host_id where idx matches
-            host_id = None
-            for nid, i in h_map.items():
-                if i == h_idx:
-                    host_id = nid
-                    break
-
-            service_id = None
-            for sid, j in s_map.items():
-                if j == s_idx:
-                    service_id = sid
-                    break
+            host_id = inv_h_map.get(h_idx)
+            service_id = inv_s_map.get(s_idx)
 
             if host_id is not None and service_id is not None:
-                edge_prob_map[(host_id, service_id)] = float(edge_probs[edge_idx])
+                raw_gnn_risk = float(edge_probs[edge_idx])
+                edge_key = (host_id, service_id)
+                observations = self.edge_observation_counts.get(edge_key, 0) + 1
+                self.edge_observation_counts[edge_key] = observations
+
+
+# A first-seen edge has insufficient temporal evidence.
+# Preserve the raw GNN score separately, but do not allow
+# an isolated first observation to become a high-confidence
+# graph threat.
+                if observations <= 1:
+                    effective_gnn_risk = 0.0
+                else:
+                    effective_gnn_risk = raw_gnn_risk
+                edge_prob_map[edge_key] = effective_gnn_risk
 
         return probs, pyg_data, h_map, s_map, edge_prob_map
 

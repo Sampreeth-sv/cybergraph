@@ -66,49 +66,196 @@ def load_artifacts_and_data():
     return rf, ae, scaler, feature_cols, ae_threshold, X, y, df
 
 
-def run_cross_dataset_generalization(rf, ae, scaler, feature_cols, ae_threshold, X_test, y_test):
-    """Simulates evaluating pre-trained models on a different flow dataset structure (e.g. CIC-IDS2017 schema mapping)."""
-    print("\n--- 1. Cross-Dataset Generalization Evaluation (Zero Retraining) ---")
-    
-    # Create cross-dataset schema variations (shifting ports, different duration scaling, altered TTL ranges)
+def run_cross_dataset_generalization(
+    rf,
+    ae,
+    scaler,
+    feature_cols,
+    ae_threshold,
+    X_test,
+    y_test
+):
+    """
+    Robustness / distribution-shift evaluation.
+
+    Uses only features that actually exist in the trained
+    47-feature RF/AE schema.
+
+    No retraining is performed.
+
+    The perturbations simulate plausible changes in:
+      - flow duration
+      - packet/byte volume
+      - throughput
+      - inter-arrival timing
+
+    NOTE:
+    This is NOT a true cross-dataset evaluation because the same
+    NF-UNSW-NB15 samples are being transformed. It is a
+    distribution-shift / feature-perturbation evaluation.
+    """
+
+    print("\n--- 1. Distribution-Shift Generalization Evaluation (Zero Retraining) ---")
+
     X_cross = X_test.copy()
-    # CIC-IDS2017 often has different TTL base and higher byte rate variances
-    X_cross["MIN_TTL"] = np.maximum(X_cross["MIN_TTL"] - 32, 0)
-    X_cross["FLOW_DURATION_MILLISECONDS"] = X_cross["FLOW_DURATION_MILLISECONDS"] * 1.05
-    
-    # RF Evaluation
+
+    # ---------------------------------------------------------
+    # Apply controlled distribution shifts only to features
+    # actually present in the trained model.
+    # ---------------------------------------------------------
+
+    shifts_applied = []
+
+    # Flow duration +5%
+    if "FLOW_DURATION_MILLISECONDS" in X_cross.columns:
+        X_cross["FLOW_DURATION_MILLISECONDS"] *= 1.05
+        shifts_applied.append("FLOW_DURATION_MILLISECONDS +5%")
+
+    # Incoming bytes +5%
+    if "IN_BYTES" in X_cross.columns:
+        X_cross["IN_BYTES"] *= 1.05
+        shifts_applied.append("IN_BYTES +5%")
+
+    # Outgoing bytes +5%
+    if "OUT_BYTES" in X_cross.columns:
+        X_cross["OUT_BYTES"] *= 1.05
+        shifts_applied.append("OUT_BYTES +5%")
+
+    # Incoming packets +5%
+    if "IN_PKTS" in X_cross.columns:
+        X_cross["IN_PKTS"] *= 1.05
+        shifts_applied.append("IN_PKTS +5%")
+
+    # Outgoing packets +5%
+    if "OUT_PKTS" in X_cross.columns:
+        X_cross["OUT_PKTS"] *= 1.05
+        shifts_applied.append("OUT_PKTS +5%")
+
+    # Source-to-destination throughput +5%
+    if "SRC_TO_DST_AVG_THROUGHPUT" in X_cross.columns:
+        X_cross["SRC_TO_DST_AVG_THROUGHPUT"] *= 1.05
+        shifts_applied.append("SRC_TO_DST_AVG_THROUGHPUT +5%")
+
+    # Destination-to-source throughput +5%
+    if "DST_TO_SRC_AVG_THROUGHPUT" in X_cross.columns:
+        X_cross["DST_TO_SRC_AVG_THROUGHPUT"] *= 1.05
+        shifts_applied.append("DST_TO_SRC_AVG_THROUGHPUT +5%")
+
+    # IAT averages +5%
+    if "SRC_TO_DST_IAT_AVG" in X_cross.columns:
+        X_cross["SRC_TO_DST_IAT_AVG"] *= 1.05
+        shifts_applied.append("SRC_TO_DST_IAT_AVG +5%")
+
+    if "DST_TO_SRC_IAT_AVG" in X_cross.columns:
+        X_cross["DST_TO_SRC_IAT_AVG"] *= 1.05
+        shifts_applied.append("DST_TO_SRC_IAT_AVG +5%")
+
+    # ---------------------------------------------------------
+    # Ensure exact feature order expected by RF/scaler
+    # ---------------------------------------------------------
+
+    X_cross = X_cross[feature_cols]
+
+    print("Applied distribution shifts:")
+    for shift in shifts_applied:
+        print(f"  - {shift}")
+
+    # ---------------------------------------------------------
+    # RANDOM FOREST
+    # ---------------------------------------------------------
+
     rf_preds = rf.predict(X_cross)
     rf_probs = rf.predict_proba(X_cross)[:, 1]
 
-    # AE Evaluation
-    X_cross_s = scaler.transform(X_cross).astype(np.float32)
-    recon = ae.predict(X_cross_s)
-    ae_mses = np.mean(np.square(recon - X_cross_s), axis=1)
-    ae_preds = (ae_mses > ae_threshold).astype(np.int8)
-
     rf_res = {
-        "accuracy": float(accuracy_score(y_test, rf_preds)),
-        "precision": float(precision_score(y_test, rf_preds, zero_division=0)),
-        "recall": float(recall_score(y_test, rf_preds, zero_division=0)),
-        "f1": float(f1_score(y_test, rf_preds, zero_division=0)),
-        "auc": float(roc_auc_score(y_test, rf_probs)),
-        "confusion_matrix": confusion_matrix(y_test, rf_preds).tolist(),
+        "accuracy": float(
+            accuracy_score(y_test, rf_preds)
+        ),
+        "precision": float(
+            precision_score(y_test, rf_preds, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(y_test, rf_preds, zero_division=0)
+        ),
+        "f1": float(
+            f1_score(y_test, rf_preds, zero_division=0)
+        ),
+        "auc": float(
+            roc_auc_score(y_test, rf_probs)
+        ),
+        "confusion_matrix": confusion_matrix(
+            y_test,
+            rf_preds
+        ).tolist(),
     }
+
+    # ---------------------------------------------------------
+    # AUTOENCODER
+    # ---------------------------------------------------------
+
+    X_cross_s = scaler.transform(X_cross).astype(np.float32)
+
+    recon = ae.predict(X_cross_s)
+
+    ae_mses = np.mean(
+        np.square(recon - X_cross_s),
+        axis=1
+    )
+
+    ae_preds = (
+        ae_mses > ae_threshold
+    ).astype(np.int8)
 
     ae_res = {
-        "accuracy": float(accuracy_score(y_test, ae_preds)),
-        "precision": float(precision_score(y_test, ae_preds, zero_division=0)),
-        "recall": float(recall_score(y_test, ae_preds, zero_division=0)),
-        "f1": float(f1_score(y_test, ae_preds, zero_division=0)),
-        "auc": float(roc_auc_score(y_test, ae_mses)),
-        "confusion_matrix": confusion_matrix(y_test, ae_preds).tolist(),
+        "accuracy": float(
+            accuracy_score(y_test, ae_preds)
+        ),
+        "precision": float(
+            precision_score(y_test, ae_preds, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(y_test, ae_preds, zero_division=0)
+        ),
+        "f1": float(
+            f1_score(y_test, ae_preds, zero_division=0)
+        ),
+        "auc": float(
+            roc_auc_score(y_test, ae_mses)
+        ),
+        "confusion_matrix": confusion_matrix(
+            y_test,
+            ae_preds
+        ).tolist(),
     }
 
-    print(f"RF Cross-Dataset -> Acc: {rf_res['accuracy']:.4f} | F1: {rf_res['f1']:.4f} | AUC: {rf_res['auc']:.4f}")
-    print(f"AE Cross-Dataset -> Acc: {ae_res['accuracy']:.4f} | F1: {ae_res['f1']:.4f} | AUC: {ae_res['auc']:.4f}")
+    # ---------------------------------------------------------
+    # RESULTS
+    # ---------------------------------------------------------
 
-    return {"rf": rf_res, "ae": ae_res}
+    print(
+        f"\nRF Distribution-Shift -> "
+        f"Acc: {rf_res['accuracy']:.6f} | "
+        f"Precision: {rf_res['precision']:.6f} | "
+        f"Recall: {rf_res['recall']:.6f} | "
+        f"F1: {rf_res['f1']:.6f} | "
+        f"AUC: {rf_res['auc']:.6f}"
+    )
 
+    print(
+        f"AE Distribution-Shift -> "
+        f"Acc: {ae_res['accuracy']:.6f} | "
+        f"Precision: {ae_res['precision']:.6f} | "
+        f"Recall: {ae_res['recall']:.6f} | "
+        f"F1: {ae_res['f1']:.6f} | "
+        f"AUC: {ae_res['auc']:.6f}"
+    )
+
+    return {
+        "evaluation_type": "feature_distribution_shift",
+        "shifts_applied": shifts_applied,
+        "rf": rf_res,
+        "ae": ae_res,
+    }
 
 def run_rf_feature_importance_ablation(rf, feature_cols, X_sample, y_sample):
     """Computes MDI Gini importance and feature ablation by masking top vs bottom features."""

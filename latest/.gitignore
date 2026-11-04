@@ -101,3 +101,12 @@ outputs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local SQLite databases
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Temporary backup files
+*.backup_*
+*.backup-*

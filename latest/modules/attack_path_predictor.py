@@ -111,7 +111,7 @@ class AttackPathPredictor:
 
             # Find next target host (HOST B) connected to primary service or next host in sequence
             other_hosts = [h for h in h_nodes if h != src_h]
-            target_host_b = other_hosts[i % len(other_hosts)] if other_hosts else "HOST:149.171.126.15"
+            target_host_b = other_hosts[i % len(other_hosts)] if other_hosts else "EXTERNAL:149.171.126.15"
 
             # Predict downstream service (SERVICE Y) on target host B
             trans_dict = self.host_to_service_transitions.get(target_host_b, {})
@@ -123,7 +123,7 @@ class AttackPathPredictor:
                 target_confidence = 0.45
 
             # Predict final destination host (HOST C)
-            target_host_c = other_hosts[(i + 1) % len(other_hosts)] if len(other_hosts) > 1 else "HOST:149.171.126.18"
+            target_host_c = other_hosts[(i + 1) % len(other_hosts)] if len(other_hosts) > 1 else "EXTERNAL:149.171.126.18"
 
             # STRICT ALTERNATING BIPARTITE PATH: HOST A -> SERVICE X -> HOST B -> SERVICE Y -> HOST C
             bipartite_chain = [

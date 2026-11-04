@@ -14,9 +14,12 @@ import os
 import time
 import math
 import json
+import logging
 import numpy as np
 import pandas as pd
 import joblib
+
+logger = logging.getLogger(__name__)
 
 from train_xgboost_ae import FEATURE_COLS
 from modules.feature_schema_validator import FeatureSchemaValidator
@@ -24,11 +27,17 @@ from modules.feature_schema_validator import FeatureSchemaValidator
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(HERE, "models")
 
-XGB_PATH = os.path.join(MODELS_DIR, "xgboost_model.json")
-AE_PATH = os.path.join(MODELS_DIR, "ae_model.pkl")
-SCALER_PATH = os.path.join(MODELS_DIR, "scaler.pkl")
-FUSION_PATH = os.path.join(MODELS_DIR, "fusion_model.pkl")
+XGB_PATH      = os.path.join(MODELS_DIR, "xgboost_model.json")
+AE_PATH       = os.path.join(MODELS_DIR, "ae_model.pkl")
+SCALER_PATH   = os.path.join(MODELS_DIR, "scaler.pkl")
+FUSION_PATH   = os.path.join(MODELS_DIR, "fusion_model.pkl")
 ARTIFACTS_PATH = os.path.join(MODELS_DIR, "xgboost_ae_artifacts.json")
+
+# ── Diagnostic buffer: last 10 live flow breakdowns (thread-safe append-only) ──
+# Populated by process_flow_record(); read by /api/pipeline_diag endpoint.
+_DIAG_MAX         = 10
+_diag_flows       = []   # list of dicts, max length _DIAG_MAX
+_diag_print_count = 0    # how many flows have been logged to console (stop at _DIAG_MAX)
 
 
 class LiveTrafficEngine:
@@ -44,6 +53,10 @@ class LiveTrafficEngine:
         self.scaler = joblib.load(SCALER_PATH)
         self.ae_model = joblib.load(AE_PATH)
         self.fusion_model = joblib.load(FUSION_PATH)
+
+        # Cache scaler stats for fast z-score reporting in diagnostics
+        self._scaler_mean  = self.scaler.mean_
+        self._scaler_scale = self.scaler.scale_
 
         with open(ARTIFACTS_PATH) as f:
             art = json.load(f)
@@ -96,19 +109,27 @@ class LiveTrafficEngine:
         dst_ip = str(raw_flow_dict.get("_dst_ip", "10.40.182.1"))
         dst_port = int(raw_flow_dict.get("_dst_port", raw_flow_dict.get("L4_DST_PORT", 80)))
         protocol = int(raw_flow_dict.get("PROTOCOL", 6))
-        timestamp = float(raw_flow_dict.get("_timestamp", time.time()))
+        timestamp = float(raw_flow_dict.get("_timestamp", time.time() * 1000.0))
+        # Normalize Unix timestamps to milliseconds for the trained GNN scaler.
+        if timestamp < 1e11:
+            timestamp *= 1000.0
         byte_cnt = float(raw_flow_dict.get("_byte_count", raw_flow_dict.get("IN_BYTES", 0.0)))
         pkt_cnt = float(raw_flow_dict.get("_pkt_count", raw_flow_dict.get("IN_PKTS", 0.0)))
         duration = float(raw_flow_dict.get("_duration", raw_flow_dict.get("FLOW_DURATION_MILLISECONDS", 1.0)))
 
         op_fields = self.validator.extract_operational_fields(raw_flow_dict, model_risk=fusion_prob)
 
-        return {
+        src_mac = raw_flow_dict.get("_src_mac") or raw_flow_dict.get("src_mac")
+        iface = raw_flow_dict.get("_iface") or raw_flow_dict.get("iface")
+
+        result = {
             "timestamp": timestamp,
             "src_ip": src_ip,
             "dst_ip": dst_ip,
             "dst_port": dst_port,
             "protocol": protocol,
+            "src_mac": src_mac,
+            "iface": iface,
             "byte_count": byte_cnt,
             "pkt_count": pkt_cnt,
             "duration": duration,
@@ -126,3 +147,71 @@ class LiveTrafficEngine:
                 "total_detection_ms": round(total_detection_ms, 2),
             },
         }
+
+        # ── Diagnostic logging: first _DIAG_MAX live flows only ───────────────
+        global _diag_flows, _diag_print_count
+        _ae_mse_diag = float(np.mean(np.square(self.ae_model.predict(feat_scaled) - feat_scaled)))
+        diag_entry = {
+            # Identity
+            "src": src_ip,
+            "dst": dst_ip,
+            "protocol": protocol,
+            "dst_port": dst_port,
+            # Flow dimensions
+            "duration_ms": float(raw_flow_dict.get("FLOW_DURATION_MILLISECONDS", 0.0)),
+            "IN_BYTES": float(raw_flow_dict.get("IN_BYTES", 0.0)),
+            "OUT_BYTES": float(raw_flow_dict.get("OUT_BYTES", 0.0)),
+            "IN_PKTS": float(raw_flow_dict.get("IN_PKTS", 0.0)),
+            "OUT_PKTS": float(raw_flow_dict.get("OUT_PKTS", 0.0)),
+            # Packet length features (THE KEY FEATURES)
+            "MIN_IP_PKT_LEN": float(raw_flow_dict.get("MIN_IP_PKT_LEN", 0.0)),
+            "MAX_IP_PKT_LEN": float(raw_flow_dict.get("MAX_IP_PKT_LEN", 0.0)),
+            "SHORTEST_FLOW_PKT": float(raw_flow_dict.get("SHORTEST_FLOW_PKT", 0.0)),
+            "LONGEST_FLOW_PKT": float(raw_flow_dict.get("LONGEST_FLOW_PKT", 0.0)),
+            # Rate features AFTER the fix
+            "src_to_dst_bytes_per_s": float(raw_flow_dict.get("SRC_TO_DST_SECOND_BYTES", 0.0)),
+            "dst_to_src_bytes_per_s": float(raw_flow_dict.get("DST_TO_SRC_SECOND_BYTES", 0.0)),
+            "src_to_dst_avg_throughput": float(raw_flow_dict.get("SRC_TO_DST_AVG_THROUGHPUT", 0.0)),
+            "dst_to_src_avg_throughput": float(raw_flow_dict.get("DST_TO_SRC_AVG_THROUGHPUT", 0.0)),
+            # Feature vector stats
+            "feature_count": int(feat_arr.shape[1]),
+            "feature_min": float(feat_arr.min()),
+            "feature_max": float(feat_arr.max()),
+            "scaled_max_zscore": float(abs(feat_scaled).max()),
+            # Model outputs
+            "xgb_prob": xgb_prob,
+            "ae_mse": _ae_mse_diag,
+            "ae_score": ae_norm,
+            "fusion_score": fusion_prob,
+            "final_risk": max(fusion_prob, 0.0),
+            "final_tier": "BENIGN" if fusion_prob < 0.35 else ("SUSPICIOUS" if fusion_prob < 0.75 else "CRITICAL"),
+        }
+        _diag_flows = (_diag_flows + [diag_entry])[-_DIAG_MAX:]
+
+        if _diag_print_count < _DIAG_MAX:
+            _diag_print_count += 1
+            # Print summary line
+            logger.info(
+                "[DIAG FLOW #%d] src=%s dst=%s proto=%s dport=%s dur_ms=%.1f "
+                "IN=%d/%dpkts OUT=%d/%dpkts "
+                "MIN_PKT=%.0f MAX_PKT=%.0f "
+                "src_B/s=%.1f z_max=%.2f "
+                "xgb=%.4f ae_mse=%.4f ae_norm=%.4f fusion=%.4f tier=%s",
+                _diag_print_count, src_ip, dst_ip, protocol, dst_port,
+                diag_entry["duration_ms"],
+                diag_entry["IN_BYTES"], int(diag_entry["IN_PKTS"]),
+                diag_entry["OUT_BYTES"], int(diag_entry["OUT_PKTS"]),
+                diag_entry["MIN_IP_PKT_LEN"], diag_entry["MAX_IP_PKT_LEN"],
+                diag_entry["src_to_dst_bytes_per_s"],
+                diag_entry["scaled_max_zscore"],
+                xgb_prob, _ae_mse_diag, ae_norm, fusion_prob,
+                diag_entry["final_tier"],
+            )
+            # Print all 47 features with z-scores
+            logger.info("  [DIAG FLOW #%d] Full feature vector:", _diag_print_count)
+            for i, col in enumerate(FEATURE_COLS):
+                raw_val = feat_arr[0, i]
+                z = (raw_val - self._scaler_mean[i]) / (self._scaler_scale[i] + 1e-9)
+                logger.info("    [%2d] %-35s raw=%10.3f  z=%+8.3f", i, col, raw_val, z)
+
+        return result
