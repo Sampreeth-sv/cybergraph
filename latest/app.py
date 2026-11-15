@@ -26,7 +26,7 @@ from config.risk_thresholds import (
 import socket
 import torch
 import joblib
-
+import ipaddress
 from modules.live_traffic_engine import LiveTrafficEngine
 from modules.online_graph_stream import OnlineGraphStream
 from modules.realtime_alert_engine import RealtimeAlertEngine
@@ -851,17 +851,115 @@ HTML_TEMPLATE = """
             document.getElementById('inspector-modal').style.display = 'none';
         }
 
-        async function executeRealBlock(targetIp) {
-            const res = await fetch(`/api/execute_real_block?ip=${targetIp}`);
-            const data = await res.json();
-            alert(`[ADMIN FIREWALL RESPONSE]:\n${data.message || data.status}`);
+         async function executeRealBlock(targetIp) {
+    try {
+        const res = await fetch("/api/execute_real_block", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ ip: targetIp })
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+            throw new Error(data.message || "Firewall block failed.");
         }
 
-        async function unblockIp(targetIp) {
-            const res = await fetch(`/api/unblock_ip?ip=${targetIp}`);
-            const data = await res.json();
-            alert(`[ADMIN UNBLOCK RESULT]:\n${data.message || data.status}`);
+        alert(
+            `[ADMIN FIREWALL RESPONSE]:\n${data.message || data.status}`
+        );
+
+    } catch (error) {
+        console.error("Firewall block error:", error);
+        alert(`Firewall block failed: ${error.message}`);
+    }
+}
+
+
+async function unblockIp(targetIp) {
+    try {
+        const res = await fetch("/api/unblock_ip", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ ip: targetIp })
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+            throw new Error(data.message || "Unblock failed.");
         }
+
+        alert(
+            `[ADMIN UNBLOCK RESULT]:\n${data.message || data.status}`
+        );
+
+    } catch (error) {
+        console.error("Firewall unblock error:", error);
+        alert(`Firewall unblock failed: ${error.message}`);
+    }
+}
+
+        async function blockIp(targetIp) {
+    try {
+        const response = await fetch("/api/execute_real_block", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                ip: targetIp
+            })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.message || "Block request failed.");
+        }
+
+        alert(
+            `[ADMIN BLOCK RESULT]:\n${data.message || data.status}`
+        );
+
+    } catch (error) {
+        console.error("Firewall block error:", error);
+        alert(`Block operation failed: ${error.message}`);
+    }
+}
+
+
+async function unblockIp(targetIp) {
+    try {
+        const response = await fetch("/api/unblock_ip", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                ip: targetIp
+            })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.message || "Unblock request failed.");
+        }
+
+        alert(
+            `[ADMIN UNBLOCK RESULT]:\n${data.message || data.status}`
+        );
+
+    } catch (error) {
+        console.error("Firewall unblock error:", error);
+        alert(`Unblock operation failed: ${error.message}`);
+    }
+}
 
         async function updateDeviceAccessSection() {
             try {
@@ -2949,8 +3047,38 @@ def mitre_mappings():
         "separation_of_concerns": "MITRE provides ATT&CK contextualization; XGBoost/AE/GNN/BARI detect and score behavior",
     })
 
+def normalize_firewall_ip(value: str) -> str:
+    """
+    Validate and normalize a target IPv4 address.
 
+    Removes known dashboard node prefixes, but does not
+    modify the actual IP address.
+    """
+    if not value:
+        raise ValueError("Missing IP address.")
+
+    clean_ip = str(value).strip()
+
+    for prefix in (
+        "HOST:",
+        "SERVICE:",
+        "EXTERNAL:",
+        "GATEWAY:",
+        "EXT:",
+        "GW:",
+        "PENDING:",
+        "SUSPICIOUS:",
+    ):
+        if clean_ip.startswith(prefix):
+            clean_ip = clean_ip[len(prefix):].strip()
+            break
+
+    try:
+        return str(ipaddress.IPv4Address(clean_ip))
+    except ipaddress.AddressValueError as exc:
+        raise ValueError("A valid IPv4 address is required.") from exc
 @app.route("/api/export_report")
+
 def export_report():
     init_engines()
     with state_lock:
@@ -3004,23 +3132,111 @@ def export_report():
     return Response(report_html, mimetype="text/html")
 
 
-@app.route("/api/execute_real_block")
+@app.route("/api/execute_real_block", methods=["POST"])
 def execute_real_block():
     init_engines()
-    target_ip = request.args.get("ip", "")
-    if not target_ip:
-        return jsonify({"status": "ERROR", "message": "Missing IP parameter."}), 400
 
-    clean_ip = target_ip.replace("HOST:", "").replace("SERVICE:", "")
-    if clean_ip.count(".") == 1 and clean_ip.endswith(".0"):
-        clean_ip = clean_ip[:-2]
+    # Only the server-local administrator can execute real blocking.
+    if not is_admin_request():
+        logger.warning(
+            "[SECURITY 403] Unauthorized firewall block attempt from %s",
+            request.remote_addr,
+        )
+        return jsonify({
+            "status": "ERROR",
+            "message": "Administrative access required.",
+        }), 403
 
-    res = fw_executor.execute_block(clean_ip, force_real=True)
-    if res["status"] in ["REAL_FIREWALL_RULE_APPLIED", "REAL_FIREWALL_RULE_ELEVATED"]:
+    data = request.get_json(silent=True) or {}
+    target_ip = data.get("ip") or request.args.get("ip")
+
+    try:
+        clean_ip = normalize_firewall_ip(target_ip)
+    except ValueError as exc:
+        return jsonify({
+            "status": "ERROR",
+            "message": str(exc),
+        }), 400
+
+    if fw_executor is None:
+        return jsonify({
+            "status": "ERROR",
+            "message": "Firewall executor is not initialized.",
+        }), 503
+
+    try:
+        result = fw_executor.execute_block(
+            clean_ip,
+            force_real=True,
+        )
+
+        if result.get("status") == "REAL_FIREWALL_RULE_APPLIED":
+            with state_lock:
+                shared_state["stats"]["real_os_rules_applied"] += 1
+                shared_state["state_version"] += 1
+
+        return jsonify(result)
+
+    except Exception:
+        logger.exception(
+            "Unexpected firewall block error for %s",
+            clean_ip,
+        )
+
+        return jsonify({
+            "status": "ERROR",
+            "message": "Unexpected firewall execution error.",
+        }), 500
+
+@app.route("/api/unblock_ip", methods=["POST"])
+def api_unblock_ip():
+    init_engines()
+
+    if not is_admin_request():
+        logger.warning(
+            "[SECURITY 403] Unauthorized firewall unblock attempt from %s",
+            request.remote_addr,
+        )
+        return jsonify({
+            "status": "ERROR",
+            "message": "Administrative access required.",
+        }), 403
+
+    data = request.get_json(silent=True) or {}
+    target_ip = data.get("ip") or request.args.get("ip")
+
+    try:
+        clean_ip = normalize_firewall_ip(target_ip)
+    except ValueError as exc:
+        return jsonify({
+            "status": "ERROR",
+            "message": str(exc),
+        }), 400
+
+    if fw_executor is None:
+        return jsonify({
+            "status": "ERROR",
+            "message": "Firewall executor is not initialized.",
+        }), 503
+
+    try:
+        result = fw_executor.execute_unblock(clean_ip)
+
         with state_lock:
-            shared_state["stats"]["real_os_rules_applied"] += 1
+            shared_state["state_version"] += 1
 
-    return jsonify(res)
+        return jsonify(result)
+
+    except Exception:
+        logger.exception(
+            "Unexpected firewall unblock error for %s",
+            clean_ip,
+        )
+
+        return jsonify({
+            "status": "ERROR",
+            "message": "Unexpected firewall unblock error.",
+        }), 500
 
 
 @app.before_request
@@ -3035,8 +3251,6 @@ def handle_device_access_request():
         g.new_device_token = None
 
     client_ip = request.remote_addr or "127.0.0.1"
-    if request.headers.get("X-Forwarded-For"):
-        client_ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
 
     g.client_device_token = token
     g.client_ip = client_ip
@@ -3058,27 +3272,29 @@ def set_device_token_cookie(response):
 
 
 def is_admin_request() -> bool:
-    """Determine if current HTTP request originates from the authoritative CyberGraph Server/Admin."""
-    srv_ip = get_server_local_ip()
-    client_ip = request.remote_addr or "127.0.0.1"
-    if request.headers.get("X-Forwarded-For"):
-        client_ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
+    """
+    Allow firewall administration only from the CyberGraph
+    server itself.
 
-    # 1. Local loopback on the server host
-    if client_ip in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):
+    Do not trust arbitrary X-Forwarded-For headers.
+    """
+    client_ip = request.remote_addr or ""
+
+    trusted_local_addresses = {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }
+
+    # Request originates from the server machine.
+    if client_ip in trusted_local_addresses:
         return True
 
-    # 2. Origin matches authoritative CyberGraph server local IP
-    if srv_ip and client_ip == srv_ip:
-        return True
+    # Request originates from the server's own LAN interface.
+    server_ip = get_server_local_ip()
 
-    # 3. Check if device token belongs to the registered server device
-    token = request.cookies.get("cybergraph_device_token")
-    if token:
-        with state_lock:
-            dev = _authorized_monitored_devices.get(token)
-            if dev and dev.get("is_server"):
-                return True
+    if server_ip and client_ip == server_ip:
+        return True
 
     return False
 

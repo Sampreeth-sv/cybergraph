@@ -110,3 +110,13 @@ data/*.sqlite3
 # Temporary backup files
 *.backup_*
 *.backup-*
+
+# Candidate experiment artifacts
+models_candidate/
+outputs_candidate/
+
+# Local backups
+backups/
+cybergraph_backup_before_ml_fixes/
+*_backup.py
+*_before_*.py

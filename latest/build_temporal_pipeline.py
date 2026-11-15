@@ -114,8 +114,9 @@ def build_pipeline():
     print(f"\nBuilding {len(all_window_dfs)} Temporal Bipartite Graph Snapshots ...")
     for w_idx, window_df in enumerate(all_window_dfs):
         builder = BipartiteGraphBuilder()
-        for _, row in window_df.iterrows():
+        for row_idx, row in window_df.iterrows():
             builder.add_flow(
+                flow_id=int(row_idx),
                 src_ip=row[src_col],
                 dst_ip=row[dst_ip_col],
                 dst_port=row[dst_port_col],

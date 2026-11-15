@@ -15,7 +15,7 @@ from collections import deque
 from typing import Optional
 
 from flow_extractor import FlowExtractor
-from modules.live_traffic_engine import LiveTrafficEngine
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ capture_status = {
 }
 
 _extractor: Optional[FlowExtractor] = None
-_engine: Optional[LiveTrafficEngine] = None
+
 
 _flows_lock  = threading.Lock()
 _status_lock = threading.Lock()
@@ -87,17 +87,16 @@ def _resolve_scapy_iface(selected: Optional[str]):
     return selected
 
 
-def _process_flow(feature_dict: dict):
-    global _engine
-    if _engine is None:
-        _engine = LiveTrafficEngine()
 
+def _process_flow(feature_dict: dict):
     feature_dict["_capture_time"] = time.time()
+
     with _flows_lock:
         live_flows.append(feature_dict)
 
     with _status_lock:
         capture_status["flows"] += 1
+
 
 
 def _run_flush(extractor: FlowExtractor):
@@ -161,11 +160,10 @@ _flush_thread:   Optional[threading.Thread] = None
 
 
 def start_capture(iface: Optional[str] = None):
-    global _capture_thread, _flush_thread, _extractor, _engine
+    global _capture_thread, _flush_thread, _extractor
 
     _stop_event.clear()
     _extractor = FlowExtractor()
-    _engine = LiveTrafficEngine()
 
     scapy_iface = _resolve_scapy_iface(iface)
 
